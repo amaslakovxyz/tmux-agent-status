@@ -20,6 +20,12 @@ source "$CURRENT_DIR/lib/sidebar-selection.sh"
 PREVIEW_MODE=0
 [[ "${1:-}" == "--preview" ]] && PREVIEW_MODE=1
 
+# Headless test seam (Task 3.3): render one frame to stdout and exit,
+# skipping mouse setup / tty control / the interactive loop. Used by
+# scripts/test/test-controls-render.sh; not a supported interactive mode.
+RENDER_ONCE=0
+[[ "${1:-}" == "--render-once" ]] && RENDER_ONCE=1
+
 # ─── Terminal setup ───────────────────────────────────────────────
 cleanup() {
     [ -n "${SELF_PANE:-}" ] && unregister_sidebar_client "$SELF_PANE"
@@ -48,11 +54,15 @@ trap handle_animation_signal USR2
 RESIZED=0
 trap 'RESIZED=1' WINCH
 
-tput civis  # hide cursor
-stty -echo 2>/dev/null
+if (( ! RENDER_ONCE )); then
+    tput civis 2>/dev/null  # hide cursor
+    stty -echo 2>/dev/null
+fi
 # Enable mouse click tracking (SGR mode) only in sidebar pane mode.
-# In popup/preview mode, skip mouse to avoid event storms.
-if (( ! PREVIEW_MODE )); then
+# In popup/preview mode, skip mouse to avoid event storms. Render-once
+# (headless test seam) also skips it — there is no real tty to enable
+# mouse reporting on, and no interactive loop to consume click events.
+if (( ! PREVIEW_MODE && ! RENDER_ONCE )); then
     printf '\033[?1000h\033[?1006h'
     SELF_PANE="${TMUX_PANE:-}"
     if [ -z "$SELF_PANE" ]; then
@@ -83,10 +93,15 @@ SEARCH_ACTIVE=0
 # Cached values from collect(), used by render().
 CUR_SESSION=""
 CUR_PANE=""
+CUR_PATH=""
 
 
 # Screen row (1-based) → selectable index. Populated by render().
 declare -a SCREEN_SEL=()
+# Screen row (1-based) → control action id ("switcher" | "sidebar" | "close").
+# Populated by the controls block at the foot of render(); Task 3.4 wires the
+# mouse-click dispatch (parallel to SCREEN_SEL's dispatch in the main loop).
+declare -A SCREEN_ACTION=()
 declare -a SPINNER_ROWS=()
 declare -a SPINNER_COLS=()
 declare -a SPINNER_BGS=()
@@ -180,6 +195,7 @@ BYEL=$'\033[1;33m'
 BGRN=$'\033[1;32m'
 BMAG=$'\033[1;35m'
 BCYN=$'\033[1;36m'
+BRED=$'\033[1;31m'  # destructive action accent (controls block: close)
 # Selection highlight: subtle background
 SEL_BG=$'\033[48;5;236m'   # dark gray bg
 CUR_BG=$'\033[48;5;235m'   # slightly darker for current session accent
@@ -201,8 +217,8 @@ _fuzzy_match() {
 # ─── Data collection (reads cache from sidebar-collector.sh) ─────
 _collect_cur_client() {
     local info
-    info=$(tmux display-message -p $'#{client_session}\t#{pane_id}\t#{window_index}' 2>/dev/null || true)
-    IFS=$'\t' read -r CUR_SESSION CUR_PANE CUR_WINDOW_INDEX <<< "$info"
+    info=$(tmux display-message -p $'#{client_session}\t#{pane_id}\t#{window_index}\t#{pane_current_path}' 2>/dev/null || true)
+    IFS=$'\t' read -r CUR_SESSION CUR_PANE CUR_WINDOW_INDEX CUR_PATH <<< "$info"
 }
 
 _sync_selected_to_current_client() {
@@ -284,6 +300,14 @@ render() {
     local W H
     read -r H W < <(stty size 2>/dev/null || echo "24 30")
     W=${W:-30}; H=${H:-24}
+
+    # Controls block (Task 3.3): reserve rows above the footer for the
+    # clickable Switcher/Sidebar/Close buttons + dir/session display, so the
+    # scrollable session list is shortened to make room instead of growing
+    # into them. Skipped entirely on short terminals — better to lose the
+    # buttons than corrupt the list.
+    local controls_rows=0
+    (( H >= 16 )) && controls_rows=6
 
     # In preview mode, session list takes left portion; preview takes right.
     local LW=$W  # list width
@@ -428,7 +452,7 @@ render() {
         fi
     done
 
-    local avail=$((H - line - 2))  # footer takes 2 lines
+    local avail=$((H - line - 2 - controls_rows))  # footer (2) + controls block
     if (( sel_render_idx >= 0 )); then
         if (( sel_render_idx < SCROLL_OFFSET )); then
             SCROLL_OFFSET=$sel_render_idx
@@ -468,8 +492,9 @@ render() {
     fi
 
     SCREEN_SEL=()
+    SCREEN_ACTION=()
 
-    local viewport_end=$((H - 2))
+    local viewport_end=$((H - 2 - controls_rows))
     for ((i=SCROLL_OFFSET; i<total_render && line<viewport_end; i++)); do
         local rtype="${render_types[$i]}"
         local sidx="${render_sel_indices[$i]}"
@@ -817,14 +842,46 @@ render() {
         ((line++))
     done
 
-    # ── Footer ──
-    buf+="$sep"
+    # ── Controls (clickable; large hit rows, migrated from the status bar
+    # per docs/adr/0013 — see Task 3.2 which stripped these from the bar) ──
+    # Absolute cursor addressing (\033[row;colH), independent of the
+    # sequential line-count above. `viewport_end` was already shortened by
+    # `controls_rows` (near the top of render()) so this band sits strictly
+    # below the scrollable list and above the footer — no overlap regardless
+    # of how many sessions/panes are listed. Skipped on short terminals
+    # (controls_rows==0) rather than corrupting the list. Written BEFORE the
+    # footer below: the footer's hint line can exceed the pane width and
+    # wrap past the last row, which scrolls the whole screen up by one —
+    # drawing controls first means that scroll (if it happens) carries them
+    # up along with everything else instead of a later footer write landing
+    # on top of them and clobbering this block.
+    if (( controls_rows > 0 )); then
+        local crow=$((viewport_end + 1))
+        _control() {  # $1=row $2=action-id $3=icon $4=label $5=color
+            SCREEN_ACTION[$1]="$2"
+            buf+="\033[${1};1H${5:-}${3} ${4}${RST}\033[K"
+        }
+        _control $((crow + 0)) switcher "≡" "Switcher"   "$BMAG"
+        _control $((crow + 1)) sidebar  "⊟" "Sidebar"    "$BCYN"
+        _control $((crow + 2)) close    "✕" "Close pane" "$BRED"
+        buf+="\033[$((crow + 3));1H\033[K"  # gap row, explicitly cleared
+        # Current dir / current session — display only (migrated from the
+        # bar's catppuccin_status_directory / catppuccin_status_session).
+        buf+="\033[$((crow + 4));1H${DIM} $(basename "${CUR_PATH:-/}")${RST}\033[K"
+        buf+="\033[$((crow + 5));1H${ACC_GRN} ${CUR_SESSION}${RST}\033[K"
+    fi
+
+    # ── Footer ── (absolute-positioned at the last two rows so it stays
+    # pinned to the bottom of the pane regardless of `viewport_end` being
+    # shortened above to make room for the controls block — otherwise the
+    # footer would collapse upward and collide with the controls.)
+    buf+="\033[$((H - 1));1H$sep"
     if (( WAIT_INPUT_ACTIVE )); then
-        buf+=" ${BCYN}Wait minutes for ${WAIT_INPUT_TARGET}: ${RST}${WAIT_INPUT_BUF}\033[K"
+        buf+="\033[${H};1H ${BCYN}Wait minutes for ${WAIT_INPUT_TARGET}: ${RST}${WAIT_INPUT_BUF}\033[K"
     elif (( SEARCH_ACTIVE )); then
-        buf+=" ${DIM}type to filter  ⏎ select  esc cancel${RST}\033[K"
+        buf+="\033[${H};1H ${DIM}type to filter  ⏎ select  esc cancel${RST}\033[K"
     else
-        buf+=" ${DIM}⏎ select  / search  w wait  p park  m mode  q quit${RST}\033[K"
+        buf+="\033[${H};1H ${DIM}⏎ select  / search  w wait  p park  m mode  q quit${RST}\033[K"
     fi
 
     # Flush entire frame at once (no flicker)
@@ -1051,6 +1108,16 @@ action_park() {
     bash "$CURRENT_DIR/park-target.sh" "$target" "$ttype"
     _LAST_STATUS_MTIME=""
 }
+
+# Headless test seam: render exactly one frame to stdout and exit, instead
+# of entering the interactive loop below. render() already flushes its
+# buffer to stdout via `printf '\033[H%b' "$buf"`, so no separate print is
+# needed here — see scripts/test/test-controls-render.sh.
+if (( RENDER_ONCE )); then
+    collect
+    render
+    exit 0
+fi
 
 # ─── Main loop ────────────────────────────────────────────────────
 NEEDS_COLLECT=1
