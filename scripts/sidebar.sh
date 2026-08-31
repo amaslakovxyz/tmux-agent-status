@@ -17,14 +17,20 @@ source "$CURRENT_DIR/lib/selection-targets.sh"
 source "$CURRENT_DIR/lib/sidebar-selection.sh"
 
 # ─── Mode ─────────────────────────────────────────────────────────
+# Flags are scanned across all args (order-independent) so the headless
+# test seam can combine --render-once with --preview to exercise the
+# PREVIEW_MODE render path without the interactive loop.
 PREVIEW_MODE=0
-[[ "${1:-}" == "--preview" ]] && PREVIEW_MODE=1
-
 # Headless test seam (Task 3.3): render one frame to stdout and exit,
 # skipping mouse setup / tty control / the interactive loop. Used by
 # scripts/test/test-controls-render.sh; not a supported interactive mode.
 RENDER_ONCE=0
-[[ "${1:-}" == "--render-once" ]] && RENDER_ONCE=1
+for _arg in "$@"; do
+    case "$_arg" in
+        --preview)     PREVIEW_MODE=1 ;;
+        --render-once) RENDER_ONCE=1 ;;
+    esac
+done
 
 # ─── Terminal setup ───────────────────────────────────────────────
 cleanup() {
@@ -304,10 +310,12 @@ render() {
     # Controls block (Task 3.3): reserve rows above the footer for the
     # clickable Switcher/Sidebar/Close buttons + dir/session display, so the
     # scrollable session list is shortened to make room instead of growing
-    # into them. Skipped entirely on short terminals — better to lose the
-    # buttons than corrupt the list.
+    # into them. Only in the persistent sidebar pane — NOT in the switcher
+    # popup (PREVIEW_MODE), where mouse is disabled so the buttons would be
+    # dead rows stealing viewport from the preview list. Skipped entirely on
+    # short terminals — better to lose the buttons than corrupt the list.
     local controls_rows=0
-    (( H >= 16 )) && controls_rows=6
+    (( ! PREVIEW_MODE && H >= 16 )) && controls_rows=6
 
     # In preview mode, session list takes left portion; preview takes right.
     local LW=$W  # list width
@@ -843,7 +851,7 @@ render() {
     done
 
     # ── Controls (clickable; large hit rows, migrated from the status bar
-    # per docs/adr/0013 — see Task 3.2 which stripped these from the bar) ──
+    # into the sidebar — the buttons were stripped from the bar upstream) ──
     # Absolute cursor addressing (\033[row;colH), independent of the
     # sequential line-count above. `viewport_end` was already shortened by
     # `controls_rows` (near the top of render()) so this band sits strictly
@@ -861,7 +869,10 @@ render() {
             SCREEN_ACTION[$1]="$2"
             buf+="\033[${1};1H${5:-}${3} ${4}${RST}\033[K"
         }
-        _control $((crow + 0)) switcher "≡" "Switcher"   "$BMAG"
+        # Colors mirror the original status-bar buttons: switch=green,
+        # sidebar=blue, close=red. No blue var exists in this palette, so
+        # cyan (BCYN) stands in for sidebar's blue.
+        _control $((crow + 0)) switcher "≡" "Switcher"   "$BGRN"
         _control $((crow + 1)) sidebar  "⊟" "Sidebar"    "$BCYN"
         _control $((crow + 2)) close    "✕" "Close pane" "$BRED"
         buf+="\033[$((crow + 3));1H\033[K"  # gap row, explicitly cleared

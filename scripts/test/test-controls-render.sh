@@ -2,9 +2,13 @@
 # Task 3.3 — controls-render test.
 #
 # Runs sidebar.sh headlessly (--render-once) against an ISOLATED tmux
-# server (never the live default socket) and asserts the new clickable
-# control-region labels ("Switcher" / "Sidebar" / "Close") are present in
-# the rendered frame.
+# server (never the live default socket) and asserts:
+#   1. the clickable control-region labels ("Switcher"/"Sidebar"/"Close")
+#      render in the persistent sidebar pane;
+#   2. "Switcher" is drawn in green (1;32) — design fidelity with the
+#      original status-bar buttons;
+#   3. the control region is ABSENT in PREVIEW_MODE (switcher popup), where
+#      mouse is disabled and the buttons would be dead clutter.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,10 +49,31 @@ fi
 # default socket.
 out="$(TMUX="${SOCK},0,${SESSID}" bash "$SIDEBAR" --render-once 2>/dev/null)"
 
+# 1. Labels present in sidebar mode.
 for want in "Switcher" "Sidebar" "Close"; do
     case "$out" in
         *"$want"*) ;;
         *) echo "FAIL: control '$want' not rendered"; exit 1 ;;
+    esac
+done
+
+# 2. Switcher is green. Isolate the escape sequence *immediately* before the
+# "Switcher" label (control writes "...H\033[1;32m<icon> Switcher"): take the
+# text up to "Switcher", then the tail after the last ESC[ — it must be the
+# bold-green SGR (1;32m). Matching the nearest preceding color avoids a false
+# pass on green ✓ glyphs elsewhere in the list.
+before_switcher="${out%%Switcher*}"
+nearest_color="${before_switcher##*$'\033['}"
+case "$nearest_color" in
+    "1;32m"*) ;;
+    *) echo "FAIL: 'Switcher' not drawn in green (1;32); nearest SGR was: ${nearest_color%%m*}m"; exit 1 ;;
+esac
+
+# 3. Controls ABSENT in PREVIEW_MODE (switcher popup) — dead buttons there.
+prev="$(TMUX="${SOCK},0,${SESSID}" bash "$SIDEBAR" --render-once --preview 2>/dev/null)"
+for unwanted in "Switcher" "Sidebar" "Close pane"; do
+    case "$prev" in
+        *"$unwanted"*) echo "FAIL: control '$unwanted' leaked into PREVIEW_MODE"; exit 1 ;;
     esac
 done
 
