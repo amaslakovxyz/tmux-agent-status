@@ -25,10 +25,17 @@ PREVIEW_MODE=0
 # skipping mouse setup / tty control / the interactive loop. Used by
 # scripts/test/test-controls-render.sh; not a supported interactive mode.
 RENDER_ONCE=0
+# Headless test seam (Task 3.4): source this file without running any of
+# it — no terminal mode changes, no tmux calls, no main loop — so a test
+# can call functions like dispatch_control() directly. Shares the
+# RENDER_ONCE terminal-setup exemptions below and returns (not exit, so
+# the sourcing shell survives) right before the main loop starts.
+SOURCE_ONLY=0
 for _arg in "$@"; do
     case "$_arg" in
         --preview)     PREVIEW_MODE=1 ;;
         --render-once) RENDER_ONCE=1 ;;
+        --source-only) SOURCE_ONLY=1 ;;
     esac
 done
 
@@ -53,14 +60,20 @@ handle_animation_signal() {
 # cleanup runs via the EXIT trap; the signal traps must actually exit —
 # a bare handler would swallow the signal (tmux sends HUP when the pane
 # closes) and leave an orphaned sidebar looping forever.
-trap cleanup EXIT
-trap 'exit 0' INT TERM HUP
-trap handle_refresh_signal USR1
-trap handle_animation_signal USR2
+# Source-only (headless unit-test seam) skips all of this: these traps
+# would otherwise attach to the *sourcing* shell (a test script) and fire
+# `cleanup`'s tty-reset escape codes on ITS exit, long after this file
+# returned control back to it.
 RESIZED=0
-trap 'RESIZED=1' WINCH
+if (( ! SOURCE_ONLY )); then
+    trap cleanup EXIT
+    trap 'exit 0' INT TERM HUP
+    trap handle_refresh_signal USR1
+    trap handle_animation_signal USR2
+    trap 'RESIZED=1' WINCH
+fi
 
-if (( ! RENDER_ONCE )); then
+if (( ! RENDER_ONCE && ! SOURCE_ONLY )); then
     tput civis 2>/dev/null  # hide cursor
     stty -echo 2>/dev/null
 fi
@@ -68,7 +81,9 @@ fi
 # In popup/preview mode, skip mouse to avoid event storms. Render-once
 # (headless test seam) also skips it — there is no real tty to enable
 # mouse reporting on, and no interactive loop to consume click events.
-if (( ! PREVIEW_MODE && ! RENDER_ONCE )); then
+# Source-only (headless unit-test seam) skips it too — sourcing must never
+# touch the calling shell's real tty or register a fake sidebar client.
+if (( ! PREVIEW_MODE && ! RENDER_ONCE && ! SOURCE_ONLY )); then
     printf '\033[?1000h\033[?1006h'
     SELF_PANE="${TMUX_PANE:-}"
     if [ -z "$SELF_PANE" ]; then
@@ -1120,6 +1135,26 @@ action_park() {
     _LAST_STATUS_MTIME=""
 }
 
+# Dispatch a click on one of the three persistent control buttons
+# (Task 3.3's SCREEN_ACTION row map). Runs the matching command in the
+# background so the sidebar's own read loop is never blocked on it.
+# TMUX_TEST_ECHO (unit-test seam) prints the resolved command instead of
+# running it, so tests never actually kill panes / spawn popups.
+dispatch_control() {
+    local cmd
+    case "$1" in
+        switcher) cmd="env TMUX_AGENT_SWITCHER_MODE=agents $CURRENT_DIR/switcher-popup-loop.sh" ;;
+        sidebar)  cmd="$CURRENT_DIR/sidebar-toggle.sh" ;;
+        close)    cmd="tmux kill-pane" ;;
+        *) return 1 ;;
+    esac
+    if [[ -n "${TMUX_TEST_ECHO:-}" ]]; then
+        printf '%s' "$cmd"
+    else
+        eval "$cmd" &
+    fi
+}
+
 # Headless test seam: render exactly one frame to stdout and exit, instead
 # of entering the interactive loop below. render() already flushes its
 # buffer to stdout via `printf '\033[H%b' "$buf"`, so no separate print is
@@ -1128,6 +1163,14 @@ if (( RENDER_ONCE )); then
     collect
     render
     exit 0
+fi
+
+# Headless test seam (Task 3.4): all functions above (dispatch_control,
+# action_switch, action_park, ...) are defined by this point — return to
+# the sourcing test script now, before the main loop would otherwise start
+# reading stdin forever. See scripts/test/test-controls-dispatch.sh.
+if (( SOURCE_ONLY )); then
+    return 0
 fi
 
 # ─── Main loop ────────────────────────────────────────────────────
@@ -1223,11 +1266,19 @@ while true; do
                             # Scroll down
                             (( SELECTED < SEL_COUNT - 1 )) && ((SELECTED++))
                         elif (( mb == 0 )); then
-                            # Left click — select + switch
-                            local clicked="${SCREEN_SEL[$my]:-}"
-                            if [[ -n "$clicked" ]] && (( clicked >= 0 && clicked < SEL_COUNT )); then
-                                SELECTED=$clicked
-                                action_switch
+                            # Left click — control row (Switcher/Sidebar/Close)
+                            # takes priority over the selectable-row map, since
+                            # the control region is drawn below the list and
+                            # would otherwise never be reachable.
+                            local act="${SCREEN_ACTION[$my]:-}"
+                            if [[ -n "$act" ]]; then
+                                dispatch_control "$act"
+                            else
+                                local clicked="${SCREEN_SEL[$my]:-}"
+                                if [[ -n "$clicked" ]] && (( clicked >= 0 && clicked < SEL_COUNT )); then
+                                    SELECTED=$clicked
+                                    action_switch
+                                fi
                             fi
                         fi
                     fi
