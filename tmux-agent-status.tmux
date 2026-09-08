@@ -100,6 +100,29 @@ if ! echo "$current_status_right" | grep -q "status-line.sh"; then
     tmux set-option -ag status-right " #($CURRENT_DIR/scripts/status-line.sh)"
 fi
 
+# Purge any hooks this plugin registered on a previous load before re-adding
+# them below. tpm re-runs this file on every `prefix+r` (source-file), and the
+# `set-hook -ga` (append) calls below would otherwise stack a fresh copy of all
+# 15 hooks each time. Left unchecked they accumulate linearly: after N reloads
+# every after-select-pane / session-created fires N stale copies, spawning N
+# subprocesses per event and congesting the server command queue (observed as
+# laggy pane focus / "click several times to switch"). Match on $CURRENT_DIR so
+# we only drop OUR hooks; other plugins' hooks on the same event survive.
+purge_plugin_hooks() {
+    local hook_type name
+    for hook_type in session-created client-attached client-session-changed \
+        after-select-pane after-select-window after-switch-client \
+        session-window-changed window-pane-changed pane-exited \
+        window-layout-changed after-new-window after-kill-window \
+        after-rename-window; do
+        while IFS= read -r name; do
+            [ -n "$name" ] && tmux set-hook -gu "$name"
+        done < <(tmux show-hooks -g "$hook_type" 2>/dev/null \
+            | grep -F "$CURRENT_DIR" | sed 's/ .*//')
+    done
+}
+purge_plugin_hooks
+
 # Set up daemon monitor to ensure smart-monitor is always running
 # Start daemon monitor on session created
 tmux set-hook -ga session-created "run-shell '$CURRENT_DIR/scripts/daemon-monitor.sh'"
